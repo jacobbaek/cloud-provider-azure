@@ -610,9 +610,29 @@ func (cnc *CloudNodeController) ensureNodeExistsByProviderID(ctx context.Context
 func (cnc *CloudNodeController) getNodeAddressesByName(ctx context.Context, node *v1.Node) ([]v1.NodeAddress, error) {
 	nodeAddresses, err := cnc.nodeProvider.NodeAddresses(ctx, types.NodeName(node.Name))
 	if err != nil {
+		if shouldIgnoreTransientLoadBalancerMetadataError(node, nodeAddresses, err) {
+			return nodeAddresses, nil
+		}
 		return nil, fmt.Errorf("error fetching node by name %s: %w", node.Name, err)
 	}
 	return nodeAddresses, nil
+}
+
+type transientLoadBalancerMetadataError interface {
+	IsTransientLoadBalancerMetadataError() bool
+}
+
+func shouldIgnoreTransientLoadBalancerMetadataError(node *v1.Node, nodeAddresses []v1.NodeAddress, err error) bool {
+	if len(nodeAddresses) == 0 {
+		return false
+	}
+
+	var transientError transientLoadBalancerMetadataError
+	if !errors.As(err, &transientError) || !transientError.IsTransientLoadBalancerMetadataError() {
+		return false
+	}
+
+	return GetCloudTaint(node.Spec.Taints) != nil
 }
 
 func nodeAddressesChangeDetected(addressSet1, addressSet2 []v1.NodeAddress) bool {

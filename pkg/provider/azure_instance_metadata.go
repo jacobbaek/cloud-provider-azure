@@ -124,6 +124,22 @@ func (e *imdsResponseError) Error() string {
 	return fmt.Sprintf("failure of getting loadbalancer metadata, status code %d", e.statusCode)
 }
 
+type transientLoadBalancerMetadataError struct {
+	err error
+}
+
+func (e *transientLoadBalancerMetadataError) Error() string {
+	return fmt.Sprintf("failed to get loadbalancer metadata: %v", e.err)
+}
+
+func (e *transientLoadBalancerMetadataError) Unwrap() error {
+	return e.err
+}
+
+func (e *transientLoadBalancerMetadataError) IsTransientLoadBalancerMetadataError() bool {
+	return true
+}
+
 // isTransientIMDSError reports whether an error from getLoadBalancerMetadata is a
 // transient failure that should be retried, as opposed to a benign response that
 // simply means the VM is not part of a standard load balancer backend pool.
@@ -202,7 +218,7 @@ func (ims *InstanceMetadataService) getMetadata(ctx context.Context, key string)
 		loadBalancerMetadata, err := ims.getLoadBalancerMetadata()
 		if err != nil {
 			if isTransientIMDSError(err) {
-				instanceMetadata.LBMetadataError = fmt.Errorf("failed to get loadbalancer metadata: %w", err)
+				instanceMetadata.LBMetadataError = &transientLoadBalancerMetadataError{err: err}
 				return instanceMetadata, nil
 			}
 			// Benign: loadbalancer metadata is not available when the VM is not in

@@ -626,7 +626,17 @@ func TestNodeAddresses(t *testing.T) {
 			loadBalancerSKU:     "standard",
 			lbStatusCode:        http.StatusServiceUnavailable,
 			useInstanceMetadata: true,
-			expectedErrMsg:      fmt.Errorf("failed to get loadbalancer metadata: %w", &imdsResponseError{statusCode: http.StatusServiceUnavailable}),
+			expectedErrMsg:      &transientLoadBalancerMetadataError{err: &imdsResponseError{statusCode: http.StatusServiceUnavailable}},
+			expectedAddress: []v1.NodeAddress{
+				{
+					Type:    v1.NodeHostName,
+					Address: "vm1",
+				},
+				{
+					Type:    v1.NodeInternalIP,
+					Address: "10.240.0.1",
+				},
+			},
 		},
 		{
 			name:                "NodeAddresses should not report error and keep instance addresses when the VM is not in a standard LB backend pool",
@@ -743,6 +753,10 @@ func TestNodeAddressesCachesLoadBalancerMetadataError(t *testing.T) {
 				return
 			}
 			ctx := context.Background()
+			expectedAddresses := []v1.NodeAddress{
+				{Type: v1.NodeHostName, Address: "vm1"},
+				{Type: v1.NodeInternalIP, Address: "10.240.0.1"},
+			}
 			for attempt := 0; attempt < 3; attempt++ {
 				instanceID, err := cloud.InstanceID(ctx, "vm1")
 				assert.NoError(t, err)
@@ -762,7 +776,7 @@ func TestNodeAddressesCachesLoadBalancerMetadataError(t *testing.T) {
 
 				addresses, err := cloud.NodeAddresses(ctx, "vm1")
 				assert.ErrorIs(t, err, metadata.LBMetadataError)
-				assert.Nil(t, addresses)
+				assert.Equal(t, expectedAddresses, addresses)
 			}
 			assert.Equal(t, int32(1), instanceRequests.Load())
 			assert.Equal(t, int32(1), loadBalancerRequests.Load())
@@ -833,7 +847,7 @@ func TestNodeAddressesLoadBalancerMetadataRecovery(t *testing.T) {
 			if assert.ErrorAs(t, err, &responseError) {
 				assert.Equal(t, statusCode, responseError.statusCode)
 			}
-			assert.Nil(t, addresses)
+			assert.Equal(t, expectedAddresses[:2], addresses)
 			failedMetadata, err := cloud.Metadata.GetMetadata(ctx, azcache.CacheReadTypeDefault)
 			if !assert.NoError(t, err) || !assert.NotNil(t, failedMetadata) {
 				return
@@ -846,7 +860,7 @@ func TestNodeAddressesLoadBalancerMetadataRecovery(t *testing.T) {
 			for attempt := 0; attempt < 3; attempt++ {
 				addresses, err = cloud.NodeAddresses(ctx, "vm1")
 				assert.ErrorIs(t, err, failedMetadata.LBMetadataError)
-				assert.Nil(t, addresses)
+				assert.Equal(t, expectedAddresses[:2], addresses)
 				metadata, err := cloud.Metadata.GetMetadata(ctx, azcache.CacheReadTypeDefault)
 				assert.NoError(t, err)
 				assert.Same(t, failedMetadata, metadata)

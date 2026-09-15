@@ -723,6 +723,84 @@ func TestUpdateNodeAddressesPreservesExternalIPOnMetadataError(t *testing.T) {
 	assert.Equal(t, originalNode, node)
 }
 
+type testTransientLoadBalancerMetadataError struct {
+	err error
+}
+
+func (e *testTransientLoadBalancerMetadataError) Error() string {
+	return e.err.Error()
+}
+
+func (e *testTransientLoadBalancerMetadataError) Unwrap() error {
+	return e.err
+}
+
+func (e *testTransientLoadBalancerMetadataError) IsTransientLoadBalancerMetadataError() bool {
+	return true
+}
+
+func TestShouldIgnoreTransientLoadBalancerMetadataError(t *testing.T) {
+	partialAddresses := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+	}
+	transientError := &testTransientLoadBalancerMetadataError{
+		err: errors.New("loadbalancer metadata temporarily unavailable"),
+	}
+
+	tests := []struct {
+		name          string
+		nodeAddresses []v1.NodeAddress
+		err           error
+		initializing  bool
+		want          bool
+	}{
+		{
+			name:          "ignore transient error while node is initializing",
+			nodeAddresses: partialAddresses,
+			err:           transientError,
+			initializing:  true,
+			want:          true,
+		},
+		{
+			name:          "do not ignore transient error after node initialization",
+			nodeAddresses: partialAddresses,
+			err:           transientError,
+			want:          false,
+		},
+		{
+			name:          "do not ignore unrelated error",
+			nodeAddresses: partialAddresses,
+			err:           errors.New("instance metadata unavailable"),
+			initializing:  true,
+			want:          false,
+		},
+		{
+			name:         "do not ignore error without partial addresses",
+			err:          transientError,
+			initializing: true,
+			want:         false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			node := &v1.Node{}
+			if test.initializing {
+				node.Spec.Taints = []v1.Taint{
+					{
+						Key:    cloudproviderapi.TaintExternalCloudProvider,
+						Value:  "true",
+						Effect: v1.TaintEffectNoSchedule,
+					},
+				}
+			}
+
+			assert.Equal(t, test.want, shouldIgnoreTransientLoadBalancerMetadataError(node, test.nodeAddresses, test.err))
+		})
+	}
+}
+
 // This test checks that a node with the external cloud provider taint is cloudprovider initialized and
 // and the provided node ip is validated with the cloudprovider and nodeAddresses are updated from the cloudprovider
 func TestNodeProvidedIPAddresses(t *testing.T) {
