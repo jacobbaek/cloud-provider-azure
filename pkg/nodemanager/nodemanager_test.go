@@ -676,8 +676,12 @@ func TestUpdateNodeAddresses(t *testing.T) {
 	assert.Equal(t, 2, len(updatedNodes[0].Status.Addresses), "Node Addresses not correctly updated")
 }
 
-func TestUpdateNodeAddressesPreservesExternalIPOnMetadataError(t *testing.T) {
+func TestUpdateNodeAddressesPreservesExternalIPOnServiceUnavailable(t *testing.T) {
 	ctx := context.Background()
+	partialAddresses := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+	}
 	node := &v1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "node0"},
 		Spec:       v1.NodeSpec{ProviderID: "node0"},
@@ -690,13 +694,18 @@ func TestUpdateNodeAddressesPreservesExternalIPOnMetadataError(t *testing.T) {
 		},
 	}
 	originalNode := node.DeepCopy()
-	updatedAddresses := append([]v1.NodeAddress(nil), node.Status.Addresses...)
-	updatedAddresses[2].Address = "20.0.0.2"
-	metadataError := errors.New("loadbalancer metadata temporarily unavailable")
+	updatedAddresses := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+		{Type: v1.NodeExternalIP, Address: "20.0.0.2"},
+	}
+	metadataError := &testLoadBalancerMetadataServiceUnavailableError{
+		err: errors.New("loadbalancer metadata temporarily unavailable"),
+	}
 	mockNP := mocknodeprovider.NewMockNodeProvider(gomock.NewController(t))
 	gomock.InOrder(
 		mockNP.EXPECT().NodeAddresses(ctx, types.NodeName("node0")).Return(node.Status.Addresses, nil),
-		mockNP.EXPECT().NodeAddresses(ctx, types.NodeName("node0")).Return(nil, metadataError).Times(2),
+		mockNP.EXPECT().NodeAddresses(ctx, types.NodeName("node0")).Return(partialAddresses, metadataError),
 		mockNP.EXPECT().NodeAddresses(ctx, types.NodeName("node0")).Return(updatedAddresses, nil),
 	)
 	client := fake.NewSimpleClientset(node)
@@ -704,13 +713,19 @@ func TestUpdateNodeAddressesPreservesExternalIPOnMetadataError(t *testing.T) {
 
 	assert.NoError(t, controller.updateNodeAddress(ctx, node))
 	assert.Empty(t, client.Actions())
-	for attempt := 0; attempt < 2; attempt++ {
-		assert.ErrorIs(t, controller.updateNodeAddress(ctx, node), metadataError)
-		assert.Empty(t, client.Actions())
-		assert.Equal(t, originalNode, node)
-	}
 
 	assert.NoError(t, controller.updateNodeAddress(ctx, node))
+	afterServiceUnavailable, err := client.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+	if assert.NoError(t, err) {
+		assert.Equal(t, []v1.NodeAddress{
+			{Type: v1.NodeHostName, Address: "node0"},
+			{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+			{Type: v1.NodeExternalIP, Address: "20.0.0.1"},
+		}, afterServiceUnavailable.Status.Addresses)
+	}
+	client.ClearActions()
+
+	assert.NoError(t, controller.updateNodeAddress(ctx, afterServiceUnavailable))
 	actions := client.Actions()
 	if assert.Len(t, actions, 1) {
 		assert.Equal(t, "patch", actions[0].GetVerb())
@@ -723,28 +738,143 @@ func TestUpdateNodeAddressesPreservesExternalIPOnMetadataError(t *testing.T) {
 	assert.Equal(t, originalNode, node)
 }
 
-type testTransientLoadBalancerMetadataError struct {
+func TestUpdateNodeAddressesRechecksExternalIPOnServiceUnavailable(t *testing.T) {
+	ctx := context.Background()
+	cachedNode := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node0"},
+		Spec:       v1.NodeSpec{ProviderID: "node0"},
+		Status: v1.NodeStatus{
+			Addresses: []v1.NodeAddress{
+				{Type: v1.NodeHostName, Address: "node0"},
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+			},
+		},
+	}
+	latestNode := cachedNode.DeepCopy()
+	latestNode.Status.Addresses = append(latestNode.Status.Addresses,
+		v1.NodeAddress{Type: v1.NodeExternalIP, Address: "20.0.0.1"},
+	)
+	partialAddresses := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+	}
+	metadataError := &testLoadBalancerMetadataServiceUnavailableError{
+		err: errors.New("loadbalancer metadata returned 503"),
+	}
+	mockNP := mocknodeprovider.NewMockNodeProvider(gomock.NewController(t))
+	mockNP.EXPECT().NodeAddresses(ctx, types.NodeName("node0")).Return(partialAddresses, metadataError)
+	client := fake.NewSimpleClientset(latestNode)
+	controller := &CloudNodeController{kubeClient: client, nodeProvider: mockNP}
+
+	assert.NoError(t, controller.updateNodeAddress(ctx, cachedNode))
+
+	updatedNode, err := client.CoreV1().Nodes().Get(ctx, latestNode.Name, metav1.GetOptions{})
+	if assert.NoError(t, err) {
+		assert.Equal(t, []v1.NodeAddress{
+			{Type: v1.NodeHostName, Address: "node0"},
+			{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+			{Type: v1.NodeExternalIP, Address: "20.0.0.1"},
+		}, updatedNode.Status.Addresses)
+	}
+}
+
+type testLoadBalancerMetadataServiceUnavailableError struct {
 	err error
 }
 
-func (e *testTransientLoadBalancerMetadataError) Error() string {
+func (e *testLoadBalancerMetadataServiceUnavailableError) Error() string {
 	return e.err.Error()
 }
 
-func (e *testTransientLoadBalancerMetadataError) Unwrap() error {
+func (e *testLoadBalancerMetadataServiceUnavailableError) Unwrap() error {
 	return e.err
 }
 
-func (e *testTransientLoadBalancerMetadataError) IsTransientLoadBalancerMetadataError() bool {
+func (e *testLoadBalancerMetadataServiceUnavailableError) IsLoadBalancerMetadataServiceUnavailableError() bool {
 	return true
 }
 
-func TestShouldIgnoreTransientLoadBalancerMetadataError(t *testing.T) {
+func TestUpdateNodeAddressesDuringInitializationPreservesExternalIP(t *testing.T) {
+	ctx := context.Background()
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node0"},
+		Spec:       v1.NodeSpec{ProviderID: "node0"},
+		Status: v1.NodeStatus{
+			Addresses: []v1.NodeAddress{
+				{Type: v1.NodeHostName, Address: "node0"},
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeExternalIP, Address: "20.0.0.1"},
+			},
+		},
+	}
+	partialAddresses := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+	}
+	metadataError := &testLoadBalancerMetadataServiceUnavailableError{
+		err: errors.New("loadbalancer metadata temporarily unavailable"),
+	}
+	mockNP := mocknodeprovider.NewMockNodeProvider(gomock.NewController(t))
+	mockNP.EXPECT().NodeAddresses(ctx, types.NodeName("node0")).Return(partialAddresses, metadataError)
+	client := fake.NewSimpleClientset(node)
+	controller := &CloudNodeController{kubeClient: client, nodeProvider: mockNP}
+
+	assert.NoError(t, controller.updateNodeAddressWithContext(ctx, node, true))
+
+	actions := client.Actions()
+	if assert.Len(t, actions, 2) {
+		assert.Equal(t, "get", actions[0].GetVerb())
+		assert.Equal(t, "patch", actions[1].GetVerb())
+		assert.Equal(t, "status", actions[1].GetSubresource())
+	}
+	updatedNode, err := client.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+	if assert.NoError(t, err) {
+		assert.Equal(t, []v1.NodeAddress{
+			{Type: v1.NodeHostName, Address: "node0"},
+			{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+			{Type: v1.NodeExternalIP, Address: "20.0.0.1"},
+		}, updatedNode.Status.Addresses)
+	}
+}
+
+func TestUpdateNodeAddressesUsesPartialAddressesForPrivateNode(t *testing.T) {
+	ctx := context.Background()
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "node0"},
+		Spec:       v1.NodeSpec{ProviderID: "node0"},
+		Status: v1.NodeStatus{
+			Addresses: []v1.NodeAddress{
+				{Type: v1.NodeHostName, Address: "node0"},
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+			},
+		},
+	}
+	partialAddresses := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+	}
+	metadataError := &testLoadBalancerMetadataServiceUnavailableError{
+		err: errors.New("loadbalancer metadata temporarily unavailable"),
+	}
+	mockNP := mocknodeprovider.NewMockNodeProvider(gomock.NewController(t))
+	mockNP.EXPECT().NodeAddresses(ctx, types.NodeName("node0")).Return(partialAddresses, metadataError)
+	client := fake.NewSimpleClientset(node)
+	controller := &CloudNodeController{kubeClient: client, nodeProvider: mockNP}
+
+	assert.NoError(t, controller.updateNodeAddress(ctx, node))
+
+	updatedNode, err := client.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+	if assert.NoError(t, err) {
+		assert.Equal(t, partialAddresses, updatedNode.Status.Addresses)
+	}
+}
+
+func TestShouldUsePartialNodeAddressesOnLoadBalancerServiceUnavailable(t *testing.T) {
 	partialAddresses := []v1.NodeAddress{
 		{Type: v1.NodeHostName, Address: "node0"},
 		{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
 	}
-	transientError := &testTransientLoadBalancerMetadataError{
+	serviceUnavailableError := &testLoadBalancerMetadataServiceUnavailableError{
 		err: errors.New("loadbalancer metadata temporarily unavailable"),
 	}
 
@@ -752,53 +882,62 @@ func TestShouldIgnoreTransientLoadBalancerMetadataError(t *testing.T) {
 		name          string
 		nodeAddresses []v1.NodeAddress
 		err           error
-		initializing  bool
 		want          bool
 	}{
 		{
-			name:          "ignore transient error while node is initializing",
+			name:          "use partial addresses during initialization",
 			nodeAddresses: partialAddresses,
-			err:           transientError,
-			initializing:  true,
+			err:           serviceUnavailableError,
 			want:          true,
 		},
 		{
-			name:          "do not ignore transient error after node initialization",
+			name:          "use partial addresses for initialized private node",
 			nodeAddresses: partialAddresses,
-			err:           transientError,
-			want:          false,
+			err:           serviceUnavailableError,
+			want:          true,
+		},
+		{
+			name:          "use partial addresses for initialized node with external IP",
+			nodeAddresses: partialAddresses,
+			err:           serviceUnavailableError,
+			want:          true,
 		},
 		{
 			name:          "do not ignore unrelated error",
 			nodeAddresses: partialAddresses,
 			err:           errors.New("instance metadata unavailable"),
-			initializing:  true,
 			want:          false,
 		},
 		{
-			name:         "do not ignore error without partial addresses",
-			err:          transientError,
-			initializing: true,
-			want:         false,
+			name: "do not ignore error without partial addresses",
+			err:  serviceUnavailableError,
+			want: false,
 		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			node := &v1.Node{}
-			if test.initializing {
-				node.Spec.Taints = []v1.Taint{
-					{
-						Key:    cloudproviderapi.TaintExternalCloudProvider,
-						Value:  "true",
-						Effect: v1.TaintEffectNoSchedule,
-					},
-				}
-			}
-
-			assert.Equal(t, test.want, shouldIgnoreTransientLoadBalancerMetadataError(node, test.nodeAddresses, test.err))
+			assert.Equal(t, test.want, shouldUsePartialNodeAddressesOnLoadBalancerServiceUnavailable(test.nodeAddresses, test.err))
 		})
 	}
+}
+
+func TestPreserveMissingInternalIPFamilies(t *testing.T) {
+	existing := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+		{Type: v1.NodeInternalIP, Address: "2001:db8::1"},
+	}
+	discovered := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+	}
+
+	assert.Equal(t, []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+		{Type: v1.NodeInternalIP, Address: "2001:db8::1"},
+	}, preserveMissingInternalIPFamilies(existing, discovered))
 }
 
 // This test checks that a node with the external cloud provider taint is cloudprovider initialized and

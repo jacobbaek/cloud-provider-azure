@@ -18,6 +18,8 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"net"
 	"strings"
 	"time"
 
@@ -171,8 +173,13 @@ func (az *Cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudpro
 
 	nodeAddresses, err := az.NodeAddresses(ctx, types.NodeName(node.Name))
 	if err != nil {
-		logger.Error(err, "failed to get the node address", "node", node.Name)
-		return &cloudprovider.InstanceMetadata{}, err
+		if !shouldUsePartialInstanceMetadataAddresses(nodeAddresses, err) {
+			logger.Error(err, "failed to get the node address", "node", node.Name)
+			return &cloudprovider.InstanceMetadata{}, err
+		}
+		nodeAddresses = preserveInstanceMetadataInternalIPFamilies(node.Status.Addresses, nodeAddresses)
+		nodeAddresses = preserveInstanceMetadataExternalIPs(node.Status.Addresses, nodeAddresses)
+		logger.V(2).Info("Using partial node addresses after loadbalancer metadata returned 503", "node", node.Name)
 	}
 	meta.NodeAddresses = nodeAddresses
 
@@ -185,4 +192,62 @@ func (az *Cloud) InstanceMetadata(ctx context.Context, node *v1.Node) (*cloudpro
 	meta.Region = zone.Region
 
 	return &meta, nil
+}
+
+func shouldUsePartialInstanceMetadataAddresses(nodeAddresses []v1.NodeAddress, err error) bool {
+	if len(nodeAddresses) == 0 {
+		return false
+	}
+
+	var serviceUnavailableError interface {
+		IsLoadBalancerMetadataServiceUnavailableError() bool
+	}
+	if !errors.As(err, &serviceUnavailableError) || !serviceUnavailableError.IsLoadBalancerMetadataServiceUnavailableError() {
+		return false
+	}
+
+	return true
+}
+
+func preserveInstanceMetadataExternalIPs(existing, discovered []v1.NodeAddress) []v1.NodeAddress {
+	result := append([]v1.NodeAddress(nil), discovered...)
+	for _, existingAddress := range existing {
+		if existingAddress.Type != v1.NodeExternalIP {
+			continue
+		}
+
+		found := false
+		for _, discoveredAddress := range discovered {
+			if discoveredAddress == existingAddress {
+				found = true
+				break
+			}
+		}
+		if !found {
+			result = append(result, existingAddress)
+		}
+	}
+	return result
+}
+
+func preserveInstanceMetadataInternalIPFamilies(existing, discovered []v1.NodeAddress) []v1.NodeAddress {
+	result := append([]v1.NodeAddress(nil), discovered...)
+	for _, existingAddress := range existing {
+		if existingAddress.Type != v1.NodeInternalIP {
+			continue
+		}
+
+		familyFound := false
+		for _, discoveredAddress := range discovered {
+			if discoveredAddress.Type == v1.NodeInternalIP &&
+				(net.ParseIP(discoveredAddress.Address).To4() == nil) == (net.ParseIP(existingAddress.Address).To4() == nil) {
+				familyFound = true
+				break
+			}
+		}
+		if !familyFound {
+			result = append(result, existingAddress)
+		}
+	}
+	return result
 }

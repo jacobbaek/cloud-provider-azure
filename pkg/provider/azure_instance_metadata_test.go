@@ -96,6 +96,38 @@ func TestFillNetInterfacePublicIPs(t *testing.T) {
 	}
 }
 
+func TestIsLoadBalancerMetadataServiceUnavailableError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "503",
+			err:  &imdsResponseError{statusCode: http.StatusServiceUnavailable},
+			want: true,
+		},
+		{
+			name: "500",
+			err:  &imdsResponseError{statusCode: http.StatusInternalServerError},
+		},
+		{
+			name: "429",
+			err:  &imdsResponseError{statusCode: http.StatusTooManyRequests},
+		},
+		{
+			name: "network error",
+			err:  errors.New("connection reset"),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, isLoadBalancerMetadataServiceUnavailableError(test.err))
+		})
+	}
+}
+
 func TestGetPlatformSubFaultDomain(t *testing.T) {
 	for _, testCase := range []struct {
 		description string

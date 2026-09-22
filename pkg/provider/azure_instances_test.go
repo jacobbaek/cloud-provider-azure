@@ -18,6 +18,7 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -42,6 +43,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	cloudprovider "k8s.io/cloud-provider"
+	cloudproviderapi "k8s.io/cloud-provider/api"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/cloud-provider-azure/pkg/azclient/interfaceclient/mock_interfaceclient"
@@ -617,7 +619,7 @@ func TestNodeAddresses(t *testing.T) {
 			},
 		},
 		{
-			name:                "NodeAddresses should report error when loadbalancer metadata returns a transient failure",
+			name:                "NodeAddresses should report error when loadbalancer metadata returns service unavailable",
 			nodeName:            "vm1",
 			metadataName:        "vm1",
 			vmType:              consts.VMTypeStandard,
@@ -626,7 +628,27 @@ func TestNodeAddresses(t *testing.T) {
 			loadBalancerSKU:     "standard",
 			lbStatusCode:        http.StatusServiceUnavailable,
 			useInstanceMetadata: true,
-			expectedErrMsg:      &transientLoadBalancerMetadataError{err: &imdsResponseError{statusCode: http.StatusServiceUnavailable}},
+			expectedErrMsg:      &loadBalancerMetadataServiceUnavailableError{err: &imdsResponseError{statusCode: http.StatusServiceUnavailable}},
+			expectedAddress: []v1.NodeAddress{
+				{
+					Type:    v1.NodeHostName,
+					Address: "vm1",
+				},
+				{
+					Type:    v1.NodeInternalIP,
+					Address: "10.240.0.1",
+				},
+			},
+		},
+		{
+			name:                "NodeAddresses should preserve legacy behavior for non-503 loadbalancer metadata errors",
+			nodeName:            "vm1",
+			metadataName:        "vm1",
+			vmType:              consts.VMTypeStandard,
+			ipV4:                "10.240.0.1",
+			loadBalancerSKU:     "standard",
+			lbStatusCode:        http.StatusInternalServerError,
+			useInstanceMetadata: true,
 			expectedAddress: []v1.NodeAddress{
 				{
 					Type:    v1.NodeHostName,
@@ -729,8 +751,8 @@ func TestNodeAddresses(t *testing.T) {
 	}
 }
 
-func TestNodeAddressesCachesLoadBalancerMetadataError(t *testing.T) {
-	for _, statusCode := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+func TestNodeAddressesCachesLoadBalancerMetadataServiceUnavailableError(t *testing.T) {
+	for _, statusCode := range []int{http.StatusServiceUnavailable} {
 		t.Run(http.StatusText(statusCode), func(t *testing.T) {
 			cloud := GetTestCloud(gomock.NewController(t))
 			cloud.UseInstanceMetadata = true
@@ -785,7 +807,7 @@ func TestNodeAddressesCachesLoadBalancerMetadataError(t *testing.T) {
 }
 
 func TestNodeAddressesLoadBalancerMetadataRecovery(t *testing.T) {
-	for _, statusCode := range []int{http.StatusServiceUnavailable, http.StatusGatewayTimeout} {
+	for _, statusCode := range []int{http.StatusServiceUnavailable} {
 		t.Run(http.StatusText(statusCode), func(t *testing.T) {
 			cloud := GetTestCloud(gomock.NewController(t))
 			cloud.UseInstanceMetadata = true
@@ -1177,6 +1199,103 @@ func TestInstanceMetadata(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, expectedMetadata, *meta)
 	})
+}
+
+func TestShouldUsePartialInstanceMetadataAddresses(t *testing.T) {
+	partialAddresses := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+	}
+	serviceUnavailableError := &loadBalancerMetadataServiceUnavailableError{
+		err: errors.New("loadbalancer metadata temporarily unavailable"),
+	}
+
+	tests := []struct {
+		name       string
+		node       *v1.Node
+		addresses  []v1.NodeAddress
+		err        error
+		want       bool
+		wantMerged []v1.NodeAddress
+	}{
+		{
+			name: "use partial addresses and preserve external IP during initialization",
+			node: &v1.Node{
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{{Key: cloudproviderapi.TaintExternalCloudProvider}},
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{{Type: v1.NodeExternalIP, Address: "20.0.0.1"}},
+				},
+			},
+			addresses: partialAddresses,
+			err:       serviceUnavailableError,
+			want:      true,
+			wantMerged: []v1.NodeAddress{
+				{Type: v1.NodeHostName, Address: "node0"},
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeExternalIP, Address: "20.0.0.1"},
+			},
+		},
+		{
+			name:      "use partial addresses for initialized private node",
+			node:      &v1.Node{},
+			addresses: partialAddresses,
+			err:       serviceUnavailableError,
+			want:      true,
+		},
+		{
+			name: "use partial addresses for initialized node with external IP",
+			node: &v1.Node{
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{{Type: v1.NodeExternalIP, Address: "20.0.0.1"}},
+				},
+			},
+			addresses: partialAddresses,
+			err:       serviceUnavailableError,
+			want:      true,
+		},
+		{
+			name:      "do not use partial addresses for unrelated error",
+			node:      &v1.Node{},
+			addresses: partialAddresses,
+			err:       errors.New("instance metadata unavailable"),
+			want:      false,
+		},
+		{
+			name: "do not use empty partial addresses",
+			node: &v1.Node{},
+			err:  serviceUnavailableError,
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, shouldUsePartialInstanceMetadataAddresses(test.addresses, test.err))
+			if test.wantMerged != nil {
+				assert.Equal(t, test.wantMerged, preserveInstanceMetadataExternalIPs(test.node.Status.Addresses, test.addresses))
+			}
+		})
+	}
+}
+
+func TestPreserveInstanceMetadataInternalIPFamilies(t *testing.T) {
+	existing := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+		{Type: v1.NodeInternalIP, Address: "2001:db8::1"},
+	}
+	discovered := []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+	}
+
+	assert.Equal(t, []v1.NodeAddress{
+		{Type: v1.NodeHostName, Address: "node0"},
+		{Type: v1.NodeInternalIP, Address: "10.0.0.2"},
+		{Type: v1.NodeInternalIP, Address: "2001:db8::1"},
+	}, preserveInstanceMetadataInternalIPFamilies(existing, discovered))
 }
 
 func TestCloud_InstanceExists(t *testing.T) {

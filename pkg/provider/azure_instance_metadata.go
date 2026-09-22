@@ -124,38 +124,25 @@ func (e *imdsResponseError) Error() string {
 	return fmt.Sprintf("failure of getting loadbalancer metadata, status code %d", e.statusCode)
 }
 
-type transientLoadBalancerMetadataError struct {
+type loadBalancerMetadataServiceUnavailableError struct {
 	err error
 }
 
-func (e *transientLoadBalancerMetadataError) Error() string {
+func (e *loadBalancerMetadataServiceUnavailableError) Error() string {
 	return fmt.Sprintf("failed to get loadbalancer metadata: %v", e.err)
 }
 
-func (e *transientLoadBalancerMetadataError) Unwrap() error {
+func (e *loadBalancerMetadataServiceUnavailableError) Unwrap() error {
 	return e.err
 }
 
-func (e *transientLoadBalancerMetadataError) IsTransientLoadBalancerMetadataError() bool {
+func (e *loadBalancerMetadataServiceUnavailableError) IsLoadBalancerMetadataServiceUnavailableError() bool {
 	return true
 }
 
-// isTransientIMDSError reports whether an error from getLoadBalancerMetadata is a
-// transient failure that should be retried, as opposed to a benign response that
-// simply means the VM is not part of a standard load balancer backend pool.
-//
-// Server-side (5xx), throttling (429) and request-timeout (408) responses are
-// treated as transient, as are non-HTTP errors such as connection resets,
-// timeouts, and malformed responses. Other 4xx responses are treated as benign.
-func isTransientIMDSError(err error) bool {
+func isLoadBalancerMetadataServiceUnavailableError(err error) bool {
 	var respErr *imdsResponseError
-	if errors.As(err, &respErr) {
-		return respErr.statusCode >= 500 ||
-			respErr.statusCode == http.StatusTooManyRequests ||
-			respErr.statusCode == http.StatusRequestTimeout
-	}
-	// Non-HTTP errors (network failure, timeout, JSON parse) are transient.
-	return true
+	return errors.As(err, &respErr) && respErr.statusCode == http.StatusServiceUnavailable
 }
 
 // NewInstanceMetadataService creates an instance of the InstanceMetadataService accessor object.
@@ -217,13 +204,10 @@ func (ims *InstanceMetadataService) getMetadata(ctx context.Context, key string)
 
 		loadBalancerMetadata, err := ims.getLoadBalancerMetadata()
 		if err != nil {
-			if isTransientIMDSError(err) {
-				instanceMetadata.LBMetadataError = &transientLoadBalancerMetadataError{err: err}
+			if isLoadBalancerMetadataServiceUnavailableError(err) {
+				instanceMetadata.LBMetadataError = &loadBalancerMetadataServiceUnavailableError{err: err}
 				return instanceMetadata, nil
 			}
-			// Benign: loadbalancer metadata is not available when the VM is not in
-			// a standard LoadBalancer backend address pool. Proceed with instance
-			// metadata as before.
 			logger.V(4).Info("Warning: failed to get loadbalancer metadata", "error", err)
 			return instanceMetadata, nil
 		}

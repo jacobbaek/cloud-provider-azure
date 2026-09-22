@@ -333,10 +333,14 @@ func (cnc *CloudNodeController) reconcileNodeLabels(node *v1.Node) error {
 
 // UpdateNodeAddress updates the nodeAddress of a single node
 func (cnc *CloudNodeController) updateNodeAddress(ctx context.Context, node *v1.Node) error {
+	return cnc.updateNodeAddressWithContext(ctx, node, false)
+}
+
+func (cnc *CloudNodeController) updateNodeAddressWithContext(ctx context.Context, node *v1.Node, duringInitialization bool) error {
 	logger := log.FromContextOrBackground(ctx).WithName("updateNodeAddress")
 	// Do not process nodes that are still tainted
 	cloudTaint := GetCloudTaint(node.Spec.Taints)
-	if cloudTaint != nil {
+	if cloudTaint != nil && !duringInitialization {
 		logger.V(5).Info("This node is still tainted. Will not process.", "nodeName", node.Name)
 		return nil
 	}
@@ -351,7 +355,7 @@ func (cnc *CloudNodeController) updateNodeAddress(ctx context.Context, node *v1.
 		return nil
 	}
 
-	nodeAddresses, err := cnc.getNodeAddressesByName(ctx, node)
+	nodeAddresses, err := cnc.getNodeAddressesByName(ctx, node, duringInitialization)
 	if err != nil {
 		return fmt.Errorf("getting node addresses for node %q: %w", node.Name, err)
 	}
@@ -458,7 +462,7 @@ func (cnc *CloudNodeController) initializeNode(ctx context.Context, node *v1.Nod
 
 		// After adding, call UpdateNodeAddress to set the CloudProvider provided IPAddresses
 		// So that users do not see any significant delay in IP addresses being filled into the node
-		err = cnc.updateNodeAddress(ctx, curNode)
+		err = cnc.updateNodeAddressWithContext(ctx, curNode, true)
 		if err != nil {
 			return err
 		}
@@ -495,7 +499,7 @@ func (cnc *CloudNodeController) getNodeModifiersFromCloudProvider(ctx context.Co
 		}
 	}
 
-	nodeAddresses, err := cnc.getNodeAddressesByName(ctx, node)
+	nodeAddresses, err := cnc.getNodeAddressesByName(ctx, node, true)
 	if err != nil {
 		return nil, err
 	}
@@ -607,10 +611,24 @@ func (cnc *CloudNodeController) ensureNodeExistsByProviderID(ctx context.Context
 	return true, nil
 }
 
-func (cnc *CloudNodeController) getNodeAddressesByName(ctx context.Context, node *v1.Node) ([]v1.NodeAddress, error) {
+func (cnc *CloudNodeController) getNodeAddressesByName(ctx context.Context, node *v1.Node, duringInitialization bool) ([]v1.NodeAddress, error) {
 	nodeAddresses, err := cnc.nodeProvider.NodeAddresses(ctx, types.NodeName(node.Name))
 	if err != nil {
-		if shouldIgnoreTransientLoadBalancerMetadataError(node, nodeAddresses, err) {
+		if isLoadBalancerMetadataServiceUnavailable(err) {
+			latestNode, getErr := cnc.kubeClient.CoreV1().Nodes().Get(ctx, node.Name, metav1.GetOptions{})
+			if getErr != nil {
+				return nil, fmt.Errorf("getting latest node %s after loadbalancer metadata returned 503: %w", node.Name, getErr)
+			}
+			node = latestNode
+		}
+		if shouldUsePartialNodeAddressesOnLoadBalancerServiceUnavailable(nodeAddresses, err) {
+			nodeAddresses = preserveMissingInternalIPFamilies(node.Status.Addresses, nodeAddresses)
+			nodeAddresses = preserveExistingExternalIPs(node.Status.Addresses, nodeAddresses)
+			log.FromContextOrBackground(ctx).V(2).Info(
+				"Using partial node addresses after loadbalancer metadata returned 503",
+				"nodeName", node.Name,
+				"duringInitialization", duringInitialization,
+			)
 			return nodeAddresses, nil
 		}
 		return nil, fmt.Errorf("error fetching node by name %s: %w", node.Name, err)
@@ -618,21 +636,68 @@ func (cnc *CloudNodeController) getNodeAddressesByName(ctx context.Context, node
 	return nodeAddresses, nil
 }
 
-type transientLoadBalancerMetadataError interface {
-	IsTransientLoadBalancerMetadataError() bool
+type loadBalancerMetadataServiceUnavailableError interface {
+	IsLoadBalancerMetadataServiceUnavailableError() bool
 }
 
-func shouldIgnoreTransientLoadBalancerMetadataError(node *v1.Node, nodeAddresses []v1.NodeAddress, err error) bool {
+func isLoadBalancerMetadataServiceUnavailable(err error) bool {
+	var serviceUnavailableError loadBalancerMetadataServiceUnavailableError
+	return errors.As(err, &serviceUnavailableError) && serviceUnavailableError.IsLoadBalancerMetadataServiceUnavailableError()
+}
+
+func shouldUsePartialNodeAddressesOnLoadBalancerServiceUnavailable(nodeAddresses []v1.NodeAddress, err error) bool {
 	if len(nodeAddresses) == 0 {
 		return false
 	}
 
-	var transientError transientLoadBalancerMetadataError
-	if !errors.As(err, &transientError) || !transientError.IsTransientLoadBalancerMetadataError() {
+	if !isLoadBalancerMetadataServiceUnavailable(err) {
 		return false
 	}
 
-	return GetCloudTaint(node.Spec.Taints) != nil
+	return true
+}
+
+func preserveExistingExternalIPs(existing, discovered []v1.NodeAddress) []v1.NodeAddress {
+	result := append([]v1.NodeAddress(nil), discovered...)
+	for _, existingAddress := range existing {
+		if existingAddress.Type != v1.NodeExternalIP {
+			continue
+		}
+
+		found := false
+		for _, discoveredAddress := range discovered {
+			if discoveredAddress == existingAddress {
+				found = true
+				break
+			}
+		}
+		if !found {
+			result = append(result, existingAddress)
+		}
+	}
+	return result
+}
+
+func preserveMissingInternalIPFamilies(existing, discovered []v1.NodeAddress) []v1.NodeAddress {
+	result := append([]v1.NodeAddress(nil), discovered...)
+	for _, existingAddress := range existing {
+		if existingAddress.Type != v1.NodeInternalIP {
+			continue
+		}
+
+		familyFound := false
+		for _, discoveredAddress := range discovered {
+			if discoveredAddress.Type == v1.NodeInternalIP &&
+				(net.ParseIP(discoveredAddress.Address).To4() == nil) == (net.ParseIP(existingAddress.Address).To4() == nil) {
+				familyFound = true
+				break
+			}
+		}
+		if !familyFound {
+			result = append(result, existingAddress)
+		}
+	}
+	return result
 }
 
 func nodeAddressesChangeDetected(addressSet1, addressSet2 []v1.NodeAddress) bool {
